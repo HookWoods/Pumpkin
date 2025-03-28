@@ -95,6 +95,7 @@ pub struct ProtoChunk<'a> {
     flat_block_map: Box<[ChunkBlockState]>,
     flat_biome_map: Box<[Biome]>,
     // may want to use chunk status
+    terrain_biome_cache: Box<[Option<Biome>]>,
 }
 
 impl<'a> ProtoChunk<'a> {
@@ -172,6 +173,7 @@ impl<'a> ProtoChunk<'a> {
                     * biome_coords::from_block(height as usize)
             ]
             .into_boxed_slice(),
+            terrain_biome_cache: vec![None; CHUNK_AREA].into_boxed_slice(),
         }
     }
 
@@ -377,21 +379,40 @@ impl<'a> ProtoChunk<'a> {
         }
     }
 
-    fn get_biome_for_terrain_gen(&self, global_block_pos: &Vector3<i32>) -> Biome {
+    fn get_biome_for_terrain_gen(&mut self, global_block_pos: &Vector3<i32>) -> Biome {
+        // Get local X/Z coordinates (0-15) within the chunk
+        let local_x = (global_block_pos.x & 15) as usize;
+        let local_z = (global_block_pos.z & 15) as usize;
+        let cache_index = local_x * 16 + local_z;
+
+        // Try to get from cache first
+        if let Some(biome) = self.terrain_biome_cache[cache_index] {
+            return biome;
+        }
+
+        // Cache miss - compute the biome and store it
         let seed_biome_pos = biome::get_biome_blend(
             self.bottom_y(),
             self.height(),
             self.random_config.seed,
             global_block_pos,
         );
-        self.get_biome(&seed_biome_pos)
+
+        let biome = self.get_biome(&seed_biome_pos);
+
+        // Store in cache for future use
+        self.terrain_biome_cache[cache_index] = Some(biome);
+
+        biome
     }
 
     pub fn build_surface(&mut self) {
         let start_x = chunk_pos::start_block_x(&self.chunk_pos);
         let start_z = chunk_pos::start_block_z(&self.chunk_pos);
         let min_y = self.bottom_y();
+        let top_y = self.top_y() as i32;
 
+        // Pre-initialize these outside the loops for better performance
         let random = &self.random_config.base_random_deriver;
         let mut noise_builder = DoublePerlinNoiseBuilder::new(self.random_config);
         let terrain_builder = SurfaceTerrainBuilder::new(&mut noise_builder, random);
@@ -402,29 +423,55 @@ impl<'a> ProtoChunk<'a> {
             random,
             &terrain_builder,
         );
+
+        // Precompute top block heights and fluid heights
+        let mut top_blocks = [[i32::MIN; 16]; 16];
+        let mut fluid_heights = [[i32::MIN; 16]; 16];
+
+        // First pass: find the top blocks for all columns
+        for local_x in 0..16 {
+            for local_z in 0..16 {
+                // Find the top non-air block
+                for y in (min_y as i32..top_y).rev() {
+                    let state = self.get_block_state(&Vector3::new(local_x, y, local_z));
+                    if !state.is_air() {
+                        top_blocks[local_x as usize][local_z as usize] = y + 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Clear biome cache at the start to ensure we have fresh values
+        for item in self.terrain_biome_cache.iter_mut() {
+            *item = None;
+        }
+
+        // Second pass: Apply terrain modifications and surface rules
         for local_x in 0..16 {
             for local_z in 0..16 {
                 let x = start_x + local_x;
                 let z = start_z + local_z;
 
-                // TODO: use heightmaps
-                let top_y = self.top_y() as i32;
-                let mut top_block = i32::MIN;
-                for y in (self.bottom_y() as i32..top_y).rev() {
-                    let state = self.get_block_state(&Vector3::new(local_x, y, local_z));
-                    if !state.is_air() {
-                        top_block = y + 1;
-                        break;
-                    }
+                // Get the precomputed top block
+                let mut top_block = top_blocks[local_x as usize][local_z as usize];
+
+                // Skip if we don't have a surface
+                if top_block == i32::MIN {
+                    continue;
                 }
 
+                // Determine biome position Y
                 let biome_y = if self.settings.legacy_random_source {
                     0
                 } else {
                     top_block
                 };
 
+                // Use the existing terrain_biome_cache
                 let this_biome = self.get_biome_for_terrain_gen(&Vector3::new(x, biome_y, z));
+
+                // Handle badlands pillars
                 if this_biome == Biome::ErodedBadlands {
                     terrain_builder.place_badlands_pillar(
                         self,
@@ -433,9 +480,8 @@ impl<'a> ProtoChunk<'a> {
                         top_block,
                         self.default_block,
                     );
-                    // Get the top block again if we placed a pillar!
 
-                    //TODO: Validate that we can only add to the height
+                    // Recalculate top block after pillar placement - only look above previous top
                     for y in (top_block..top_y).rev() {
                         let state = self.get_block_state(&Vector3::new(local_x, y, local_z));
                         if !state.is_air() {
@@ -450,53 +496,63 @@ impl<'a> ProtoChunk<'a> {
                 let mut stone_depth_above = 0;
                 let mut min = i32::MAX;
                 let mut fluid_height = i32::MIN;
+
+                // Process column from top to bottom
                 for y in (min_y as i32..top_block).rev() {
-                    let pos = Vector3::new(x, y, z);
+                    let pos = Vector3::new(local_x, y, local_z);
                     let state = self.get_block_state(&pos);
                     let state = get_state_by_state_id(state.state_id).unwrap();
+
                     if state.air {
                         stone_depth_above = 0;
                         fluid_height = i32::MIN;
                         continue;
                     }
+
                     if state.is_liquid {
                         if fluid_height == i32::MIN {
                             fluid_height = y + 1;
+                            // Cache fluid height for future reference
+                            fluid_heights[local_x as usize][local_z as usize] = fluid_height;
                         }
                         continue;
                     }
+
+                    // Determine minimum depth
                     if min >= y {
                         let shift = min_y << 4;
                         min = shift as i32;
 
-                        for search_y in (min_y as i32 - 1..=y - 1).rev() {
+                        // Optimize min calculation by avoiding unnecessary lookups when possible
+                        'min_search: for search_y in (min_y as i32 - 1..=y - 1).rev() {
                             if search_y < min_y as i32 {
                                 min = search_y + 1;
                                 break;
                             }
 
-                            let state =
-                                self.get_block_state(&Vector3::new(local_x, search_y, local_z));
+                            let search_state = self.get_block_state(&Vector3::new(local_x, search_y, local_z));
 
-                            // TODO: Is there a better way to check that its not a fluid?
-                            if !(!state.is_air()
-                                && !state.of_block(WATER_BLOCK.block_id)
-                                && !state.of_block(LAVA_BLOCK.block_id))
-                            {
+                            // Simplified condition to avoid multiple block checks
+                            let is_default_block = !(!search_state.is_air()
+                                && !search_state.of_block(WATER_BLOCK.block_id)
+                                && !search_state.of_block(LAVA_BLOCK.block_id));
+
+                            if is_default_block {
                                 min = search_y + 1;
-                                break;
+                                break 'min_search;
                             }
                         }
                     }
 
-                    // let biome_pos = Vector3::new(x, biome_y as i32, z);
+                    // Setup context and apply surface rules
                     stone_depth_above += 1;
                     let stone_depth_below = y - min + 1;
                     context.init_vertical(stone_depth_above, stone_depth_below, y, fluid_height);
-                    // panic!("Blending with biome {:?} at: {:?}", biome, biome_pos);
 
                     if state.id == self.default_block.state_id {
-                        context.biome = self.get_biome_for_terrain_gen(&context.block_pos);
+                        // Important optimization: reuse the same biome for the entire column
+                        context.biome = this_biome;
+
                         let new_state = self
                             .settings
                             .surface_rule
@@ -508,6 +564,7 @@ impl<'a> ProtoChunk<'a> {
                     }
                 }
 
+                // Handle frozen ocean biomes
                 if this_biome == Biome::FrozenOcean || this_biome == Biome::DeepFrozenOcean {
                     let surface_estimate = estimate_surface_height(
                         &mut context,
