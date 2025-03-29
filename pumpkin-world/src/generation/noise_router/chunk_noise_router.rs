@@ -418,10 +418,18 @@ impl<'a> ChunkNoiseRouter<'a> {
         mapper: &impl IndexToNoisePos,
         sample_options: &mut ChunkNoiseFunctionSampleOptions,
     ) {
-        let indices = &self.cell_indices;
-        let components = &mut self.component_stack;
-        for cell_cache_index in indices {
-            let (component_stack, component) = components.split_at_mut(*cell_cache_index);
+        // Early exit if no cell cache indices
+        if self.cell_indices.is_empty() {
+            return;
+        }
+
+        // Process in ascending order of cell cache indices
+        // This can help with cache locality since lower indices are accessed first
+        let mut sorted_indices = self.cell_indices.to_vec();
+        sorted_indices.sort_unstable();
+
+        for &cell_cache_index in &sorted_indices {
+            let (component_stack, component) = self.component_stack.split_at_mut(cell_cache_index);
 
             let ChunkNoiseFunctionComponent::Chunk(chunk) = component.first_mut().unwrap() else {
                 unreachable!();

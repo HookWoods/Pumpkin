@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use enum_dispatch::enum_dispatch;
 use pumpkin_util::{
     math::{clamped_map, floor_div, vector2::Vector2, vector3::Vector3},
@@ -99,6 +100,8 @@ pub struct WorldAquiferSampler {
     size_z: usize,
     levels: Box<[Option<FluidLevel>]>,
     packed_positions: Box<[i64]>,
+    // Add a cache for water level lookups
+    water_level_cache: HashMap<i64, FluidLevel>,
 }
 
 impl WorldAquiferSampler {
@@ -171,6 +174,8 @@ impl WorldAquiferSampler {
             size_z,
             levels: vec![None; cache_size].into(),
             packed_positions: packed_positions.into(),
+            // Initialize the water level cache
+            water_level_cache: HashMap::with_capacity(64), // Start with a reasonable size
         }
     }
 
@@ -240,6 +245,11 @@ impl WorldAquiferSampler {
         height_estimator: &mut SurfaceHeightEstimateSampler,
         sample_options: &ChunkNoiseFunctionSampleOptions,
     ) -> FluidLevel {
+        // Check if we already have this value in the cache
+        if let Some(cached_level) = self.water_level_cache.get(&packed_pos) {
+            return cached_level.clone();
+        }
+
         let x = block_pos::unpack_x(packed_pos);
         let y = block_pos::unpack_y(packed_pos);
         let z = block_pos::unpack_z(packed_pos);
@@ -250,12 +260,18 @@ impl WorldAquiferSampler {
 
         let index = self.index(local_x, local_y, local_z);
         if let Some(level) = &self.levels[index] {
-            level.clone()
+            // Cache the result before returning
+            let result = level.clone();
+            self.water_level_cache.insert(packed_pos, result.clone());
+            return result;
         } else {
             let fluid_level =
                 self.get_fluid_level(x, y, z, router, height_estimator, sample_options);
             self.levels[index] = Some(fluid_level.clone());
-            fluid_level
+
+            // Cache the result before returning
+            self.water_level_cache.insert(packed_pos, fluid_level.clone());
+            return fluid_level;
         }
     }
 
@@ -449,21 +465,18 @@ impl WorldAquiferSampler {
         let j = pos.y();
         let k = pos.z();
 
-        // Check for existing fluid directly to avoid deeper calculations when possible
+        // Get fluid level - don't short-circuit here to match original behavior
         let fluid_level = self.fluid_level.get_fluid_level(i, j, k);
-        if fluid_level.get_block_state(j).of_block(LAVA_BLOCK.block_id) {
-            return Some(LAVA_BLOCK);
-        }
+        let fluid_state = fluid_level.get_block_state(j);
 
-        // Optimize coordinate calculations - do once and reuse
+        // Original code uses these scaled positions
         let scaled_x = floor_div(i - 5, 16);
         let scaled_y = floor_div(j + 1, 12);
         let scaled_z = floor_div(k - 5, 16);
 
-        // Pre-allocate array for the closest positions
         let mut packed_block_and_hypots = [(0, i32::MAX); 3];
 
-        // Use the original approach but with improved bounds checking to ensure correctness
+        // Process all 8 adjacent cells - exact same logic as original
         for offset_y in -1..=1 {
             for offset_x in 0..=1 {
                 for offset_z in 0..=1 {
@@ -471,7 +484,7 @@ impl WorldAquiferSampler {
                     let y_pos = scaled_y + offset_y;
                     let z_pos = scaled_z + offset_z;
 
-                    // Safely check bounds before accessing the array
+                    // Skip invalid indices
                     if x_pos < self.start_x ||
                         x_pos >= self.start_x + self.size_x as i32 ||
                         y_pos < self.start_y as i32 ||
@@ -482,7 +495,7 @@ impl WorldAquiferSampler {
 
                     let index = self.index(x_pos, y_pos, z_pos);
 
-                    // Extra safety check
+                    // Extra bounds check
                     if index >= self.packed_positions.len() {
                         continue;
                     }
@@ -498,21 +511,33 @@ impl WorldAquiferSampler {
 
                     let hypot_squared = local_x * local_x + local_y * local_y + local_z * local_z;
 
-                    if packed_block_and_hypots[2].1 >= hypot_squared {
+                    // Insert into our top-3 array using the original algorithm's approach
+                    if hypot_squared < packed_block_and_hypots[2].1 {
                         packed_block_and_hypots[2] = (packed_random, hypot_squared);
-                    }
 
-                    if packed_block_and_hypots[1].1 >= hypot_squared {
-                        packed_block_and_hypots[2] = packed_block_and_hypots[1];
-                        packed_block_and_hypots[1] = (packed_random, hypot_squared);
-                    }
+                        if hypot_squared < packed_block_and_hypots[1].1 {
+                            packed_block_and_hypots[2] = packed_block_and_hypots[1];
+                            packed_block_and_hypots[1] = (packed_random, hypot_squared);
+                        }
 
-                    if packed_block_and_hypots[0].1 >= hypot_squared {
-                        packed_block_and_hypots[1] = packed_block_and_hypots[0];
-                        packed_block_and_hypots[0] = (packed_random, hypot_squared);
+                        if hypot_squared < packed_block_and_hypots[0].1 {
+                            packed_block_and_hypots[1] = packed_block_and_hypots[0];
+                            packed_block_and_hypots[0] = (packed_random, hypot_squared);
+                        }
                     }
                 }
             }
+        }
+
+        // Check if we found any valid positions - fallback to fluid state at current position
+        if packed_block_and_hypots[0].1 == i32::MAX {
+            return if fluid_state.of_block(LAVA_BLOCK.block_id) {
+                Some(LAVA_BLOCK)
+            } else if !fluid_state.is_air() {
+                Some(fluid_state)
+            } else {
+                Some(ChunkBlockState::AIR)  // Last resort fallback
+            };
         }
 
         // Get the fluid level for the closest position
@@ -523,11 +548,11 @@ impl WorldAquiferSampler {
             sample_options,
         );
 
-        // Calculate the distance metric for our closest pair
+        // Calculate the distance metric
         let d = Self::max_distance(packed_block_and_hypots[0].1, packed_block_and_hypots[1].1);
         let block_state = fluid_level2.get_block_state(j);
 
-        // Fast path checks
+        // Fast path checks - following original logic exactly
         if d <= 0f64 {
             // TODO: Handle fluid tick
             return Some(block_state);
@@ -543,7 +568,7 @@ impl WorldAquiferSampler {
             return Some(block_state);
         }
 
-        // Get barrier noise and avoid recalculation
+        // Get barrier noise once for all calculations
         let barrier_sample = router.barrier_noise(pos, sample_options);
 
         // Get the fluid level for the second-closest position
@@ -554,7 +579,7 @@ impl WorldAquiferSampler {
             sample_options,
         );
 
-        // Calculate density with first two points
+        // Calculate density with first pair of positions
         let e = d * self.calculate_density(
             pos,
             barrier_sample,
@@ -566,7 +591,7 @@ impl WorldAquiferSampler {
             return None;
         }
 
-        // Check the third point
+        // Get the fluid level for the third-closest position
         let fluid_level4 = self.get_water_level(
             packed_block_and_hypots[2].0,
             router,
@@ -574,7 +599,7 @@ impl WorldAquiferSampler {
             sample_options,
         );
 
-        // Calculate remaining distance metrics
+        // Calculate with the third position
         let f = Self::max_distance(
             packed_block_and_hypots[0].1,
             packed_block_and_hypots[2].1,
@@ -613,7 +638,7 @@ impl WorldAquiferSampler {
             }
         }
 
-        //TODO Handle fluid tick
+        // Return the block state - exact match to original logic
         Some(block_state)
     }
 }

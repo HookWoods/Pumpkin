@@ -26,7 +26,7 @@ pub enum SampleAction {
 }
 
 pub struct ChunkNoiseFunctionSampleOptions {
-    populating_caches: bool,
+    pub(crate) populating_caches: bool,
     pub(crate) action: SampleAction,
 
     // Global IDs for the `CacheOnce` wrapper
@@ -426,10 +426,10 @@ impl Cache2D {
 pub struct CacheOnce {
     input_index: usize,
     cache_result_unique_id: u64,
-    cache_fill_unique_id: u64,
+    pub(crate) cache_fill_unique_id: u64,
     last_sample_result: f64,
 
-    cache: Box<[f64]>,
+    pub(crate) cache: Box<[f64]>,
 
     min_value: f64,
     max_value: f64,

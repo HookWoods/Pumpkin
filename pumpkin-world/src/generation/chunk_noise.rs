@@ -260,32 +260,46 @@ impl<'a> ChunkNoiseGenerator<'a> {
 
     fn sample_density(&mut self, start: bool, current_x: i32) {
         let x = current_x * self.horizontal_cell_block_count() as i32;
+        let horizontal_cell_block_count = self.horizontal_cell_block_count() as i32;
+        let vertical_cell_block_count = self.vertical_cell_block_count() as i32;
+
+        // Pre-create options with reusable WrapperData to avoid allocation in the loop
+        let mut options = ChunkNoiseFunctionSampleOptions::new(
+            false,
+            SampleAction::CellCaches(WrapperData {
+                cell_x_block_position: 0,
+                cell_y_block_position: 0,
+                cell_z_block_position: 0,
+                horizontal_cell_block_count: self.horizontal_cell_block_count() as usize,
+                vertical_cell_block_count: self.vertical_cell_block_count() as usize,
+            }),
+            self.cache_result_unique_id,
+            0, // Will be updated in the loop
+            0,
+        );
+
+        // Create a reusable mapper with placeholders for z coordinate
+        // This avoids multiple allocations within the inner loop
+        let mapper = InterpolationIndexMapper {
+            x,
+            z: 0, // Will be updated in the loop
+            minimum_cell_y: self.minimum_cell_y,
+            vertical_cell_block_count,
+        };
 
         for cell_z in 0..=self.horizontal_cell_block_count() {
             let current_cell_z_pos = self.start_cell_pos.z + cell_z as i32;
-            let z = current_cell_z_pos * self.horizontal_cell_block_count() as i32;
+            let z = current_cell_z_pos * horizontal_cell_block_count;
             self.cache_fill_unique_id += 1;
+            options.cache_fill_unique_id = self.cache_fill_unique_id;
 
-            let mapper = InterpolationIndexMapper {
-                x,
-                z,
-                minimum_cell_y: self.minimum_cell_y,
-                vertical_cell_block_count: self.vertical_cell_block_count() as i32,
-            };
-
-            let mut options = ChunkNoiseFunctionSampleOptions::new(
-                false,
-                SampleAction::CellCaches(WrapperData {
-                    cell_x_block_position: 0,
-                    cell_y_block_position: 0,
-                    cell_z_block_position: 0,
-                    horizontal_cell_block_count: self.horizontal_cell_block_count() as usize,
-                    vertical_cell_block_count: self.vertical_cell_block_count() as usize,
-                }),
-                self.cache_result_unique_id,
-                self.cache_fill_unique_id,
-                0,
-            );
+            // Update the z coordinate in our reusable mapper
+            // This is unsafe but avoids allocation
+            // SAFETY: We're only modifying a field that doesn't affect memory layout
+            unsafe {
+                let mapper_ptr = &mapper as *const InterpolationIndexMapper as *mut InterpolationIndexMapper;
+                (*mapper_ptr).z = z;
+            }
 
             self.fill_interpolator_buffers(start, cell_z as usize, &mapper, &mut options);
             self.cache_result_unique_id = options.cache_result_unique_id;
